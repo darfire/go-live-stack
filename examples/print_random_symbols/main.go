@@ -7,7 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 
-	live_stack "github.com/darfire/live-stack"
+	live_stack "github.com/darfire/go-live-stack"
 )
 
 func getRandomIp(regions []*live_stack.MappedRegion, totalSize uint64) uint64 {

@@ -1,6 +1,6 @@
-# live-stack
+# go-live-stack
 
-**live-stack** offers tools to resolve the stack trace of running Linux process, given the instruction pointers.
+**go-live-stack** offers tools to resolve the stack trace of running Linux process, given the instruction pointers.
 
 It leverages both the [/proc/pid/maps](https://www.kernel.org/doc/Documentation/filesystems/proc.txt) and the [ELF](https://refspecs.linuxfoundation.org/elf/elf.pdf) file format to resolve the symbols that the instruction pointers reference. The ELF files must not be stripped of their symbol tables.
 
@@ -13,7 +13,7 @@ You can obtain this information using gdb using the following command:
 (gdb) info proc mappings
 ```
 
-However, for programmatic use, you need to implement it yourself or use something like **live-stack**.
+However, for programmatic use, you need to implement it yourself or use something like **go-live-stack**.
 
 Personally, I use it to resolve stacks that I collect using EBPF probes.
 
