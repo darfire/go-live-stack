@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+type Permissions uint32
+
 const (
 	READ    = 1
 	WRITE   = 2
@@ -20,43 +22,140 @@ const (
 	PRIVATE = 16
 )
 
-type MappedRegion struct {
-	Start       uint64
-	End         uint64
-	Permissions uint32
-	Offset      uint64
-	Device      string
-	Inode       uint64
-	Pathname    string
-	IsFile      bool
+func (perm Permissions) String() string {
+	var sb strings.Builder
+
+	if (perm & READ) != 0 {
+		sb.WriteString("r")
+	} else {
+		sb.WriteString("-")
+	}
+
+	if (perm & WRITE) != 0 {
+		sb.WriteString("w")
+	} else {
+		sb.WriteString("-")
+	}
+
+	if (perm & EXECUTE) != 0 {
+		sb.WriteString("x")
+	} else {
+		sb.WriteString("-")
+	}
+
+	if (perm & SHARED) != 0 {
+		sb.WriteString("s")
+	} else if (perm & PRIVATE) != 0 {
+		sb.WriteString("p")
+	} else {
+		sb.WriteString("-")
+	}
+
+	return sb.String()
 }
 
+// Parse a line from /proc/<pid>/maps
+
+// Each MappedRegion corresponds to a single line in /proc/<pid>/maps. It describes
+// a memory area mapped into the process's virtual memory space.
+type MappedRegion struct {
+	// Start of the virtual memory region
+	Start uint64
+	// End of the virtual memory region
+	End uint64
+	// Permissions of the memory region; can be a combination of READ, WRITE, EXECUTE and zero or one of SHARED or PRIVATE
+	Permissions Permissions
+	// Offset in the associated file
+	Offset uint64
+	// The device where the associated file is stored
+	Device string
+	// The inode associated with the mapped file
+	Inode uint64
+	// The full path to the mapped file, or the memory segment like [stack], [heap], etc.
+	Pathname string
+	// Whether Pathname points to a file
+	IsFile bool
+}
+
+// Check if the memory is executable
 func (region *MappedRegion) IsExecutable() bool {
 	return (region.Permissions & EXECUTE) != 0
 }
 
-type ProcessContext struct {
-	Pid uint32
+// Check if it's mapped from a file and executable
+func (region *MappedRegion) IsExecutableFile() bool {
+	return region.IsExecutable() && region.IsFile
+}
 
+// The size of the memory region
+func (region *MappedRegion) Size() uint64 {
+	return region.End - region.Start
+}
+
+// A wrapper objects around the data on a running process and it's consituend ELF binaries
+type ProcessContext struct {
+	// The process id
+	Pid int
+
+	// Mapped regions from /proc/<pid>/maps
 	Regions []MappedRegion
 
+	// The parsed ELF files for the executable and shared libraries
 	Elfs map[string]ElfContext
 }
 
+func (ctx *ProcessContext) String() string {
+	return fmt.Sprintf("ProcessContext(pid=%d, regions=%d)\n", ctx.Pid, len(ctx.Regions))
+}
+
+// A StackFrame, possibly resolved
 type StackFrame struct {
+	// The instruction pointer in the running process's memory
 	InstructionPointer uint64
-	Symbol             *elf.Symbol
-	Offset             uint64
-	Region             *MappedRegion
-	Error              error
+	// The resolved symbol
+	Symbol *Symbol
+	// The offset inside the symbol
+	Offset uint64
+	// The mapped region where this address resides
+	Region *MappedRegion
+	// The error, if resolving the symbol failed
+	Error error
 }
 
+// All the information related to a symbol from the symbol table of an ELF file
+type Symbol struct {
+	// The original ELF-file symbol in the symbol table
+	elf.Symbol
+	// The offset inside the file where this symbol resides
+	FileOffset uint64
+}
+
+func (frame *StackFrame) Describe(idx int) string {
+	var sb strings.Builder
+
+	fmt.Fprintf(&sb, "Index: %d, Instruction Pointer: 0x%0x\n", idx, frame.InstructionPointer)
+
+	if frame.Error != nil {
+		fmt.Fprintf(&sb, "\tError: %s\n", frame.Error)
+	} else if frame.Symbol != nil {
+		fmt.Fprintf(&sb, "\tSymbol: %s (base=0x%x, size=0x%x), offset=0x%x\n",
+			frame.Symbol.Name, frame.Symbol.Value, frame.Symbol.Size, frame.Offset)
+		fmt.Fprintf(&sb, "\tFile Offset: 0x%x\n", frame.Symbol.FileOffset)
+	}
+	return sb.String()
+}
+
+// A parsed ELF file
 type ElfContext struct {
+	// The path of the ELF file
 	Pathname string
-	File     *elf.File
-	Symbols  []elf.Symbol
+	// The ELF file handle
+	File *elf.File
+	// The complete symbol table, sorted by FileOffset
+	Symbols []Symbol
 }
 
+// Parse an ELF file
 func NewElfContext(pathname string) (ElfContext, error) {
 	file, err := os.Open(pathname)
 
@@ -71,37 +170,86 @@ func NewElfContext(pathname string) (ElfContext, error) {
 		return ElfContext{}, err
 	}
 
-	symbols, err := elfFile.Symbols()
+	elfSymbols, err := elfFile.Symbols()
 
 	if err != nil {
 		return ElfContext{}, err
 	}
 
-	slices.SortFunc(symbols, func(a, b elf.Symbol) int {
-		return cmp.Compare(a.Value, b.Value)
+	symbols := make([]Symbol, 0, len(elfSymbols))
+
+	nSections := len(elfFile.Sections)
+
+	for _, s := range elfSymbols {
+		fileOffset := 0
+
+		if int(s.Section) < nSections {
+			section := elfFile.Sections[s.Section]
+			fileOffset = int(s.Value-section.Addr) + int(section.Offset)
+		}
+
+		symbols = append(symbols, Symbol{
+			Symbol:     s,
+			FileOffset: uint64(fileOffset),
+		})
+	}
+
+	slices.SortFunc(symbols, func(a, b Symbol) int {
+		return cmp.Compare(a.FileOffset, b.FileOffset)
 	})
 
-	return ElfContext{
+	ctx := ElfContext{
 		Pathname: pathname,
 		Symbols:  symbols,
 		File:     elfFile,
-	}, nil
+	}
+
+	/*
+	   fmt.Printf("Describing elf file: %s\n", pathname)
+
+	   fmt.Printf("Sections: %d\n", len(ctx.File.Sections))
+
+	   for idx, section := range ctx.File.Sections {
+	   fmt.Printf("Section %d: %s (base=0x%x, size=0x%x, offset=0x%x), type=%s\n",
+	   idx, section.Name, section.Addr, section.Size, section.Offset, section.Type)
+	   }
+
+	   fmt.Printf("Symbols: %d\n", len(symbols))
+	   for _, symbol := range ctx.Symbols {
+	   section := ctx.GetSection(symbol.Section)
+
+	   fmt.Printf(
+	   "Symbol: %s (base=0x%x, size=0x%x) sectionIdx=%s",
+	   symbol.Name, symbol.Value, symbol.Size, symbol.Section)
+
+	   if section != nil {
+	   fileOffset := (symbol.Value - section.Addr) + section.Offset
+	   fmt.Printf(
+	   ", section: %s (base=0x%x, size=0x%x, offset=0x%x), fileOffset=0x%x",
+	   section.Name, section.Addr, section.Size, section.Offset, fileOffset)
+	   }
+
+	   fmt.Println()
+	   }
+	*/
+
+	return ctx, nil
 }
 
-func ParseAddress(str string) (uint64, uint64, error) {
+func parseAddress(str string) (uint64, uint64, error) {
 	tokens := strings.Split(str, "-")
 
 	if len(tokens) != 2 {
 		return 0, 0, errors.New("invalid address format")
 	}
 
-	start, err := strconv.ParseUint(tokens[0], 16, 16)
+	start, err := strconv.ParseUint(tokens[0], 16, 64)
 
 	if err != nil {
 		return 0, 0, err
 	}
 
-	end, err := strconv.ParseUint(tokens[1], 16, 16)
+	end, err := strconv.ParseUint(tokens[1], 16, 64)
 
 	if err != nil {
 		return 0, 0, err
@@ -110,12 +258,12 @@ func ParseAddress(str string) (uint64, uint64, error) {
 	return start, end, nil
 }
 
-func ParsePermissions(str string) (uint32, error) {
+func parsePermissions(str string) (Permissions, error) {
 	if len(str) != 4 {
 		return 0, errors.New("invalid permissions format")
 	}
 
-	var val uint32 = 0
+	var val Permissions = 0
 
 	for _, c := range str {
 		switch c {
@@ -129,6 +277,8 @@ func ParsePermissions(str string) (uint32, error) {
 			val = val | SHARED
 		case 'p':
 			val = val | PRIVATE
+		case '-':
+			continue
 		default:
 			return 0, errors.New("invalid permission flag")
 		}
@@ -137,26 +287,26 @@ func ParsePermissions(str string) (uint32, error) {
 	return val, nil
 }
 
-func ParseMappedRegion(line string) (MappedRegion, error) {
+func parseMappedRegion(line string) (MappedRegion, error) {
 	tokens := strings.Fields(line)
 
 	if len(tokens) < 5 || len(tokens) > 6 {
 		return MappedRegion{}, errors.New("invalid mapped region format")
 	}
 
-	start, end, err := ParseAddress(tokens[0])
+	start, end, err := parseAddress(tokens[0])
 
 	if err != nil {
 		return MappedRegion{}, err
 	}
 
-	permissions, err := ParsePermissions(tokens[1])
+	permissions, err := parsePermissions(tokens[1])
 
 	if err != nil {
 		return MappedRegion{}, err
 	}
 
-	offset, err := strconv.ParseUint(tokens[2], 16, 16)
+	offset, err := strconv.ParseUint(tokens[2], 16, 64)
 
 	if err != nil {
 		return MappedRegion{}, err
@@ -164,7 +314,7 @@ func ParseMappedRegion(line string) (MappedRegion, error) {
 
 	device := tokens[3]
 
-	inode, err := strconv.ParseUint(tokens[4], 10, 10)
+	inode, err := strconv.ParseUint(tokens[4], 10, 64)
 
 	if err != nil {
 		return MappedRegion{}, err
@@ -178,7 +328,7 @@ func ParseMappedRegion(line string) (MappedRegion, error) {
 
 	isFile := len(pathname) > 0 && pathname[0] != '['
 
-	return MappedRegion{
+	region := MappedRegion{
 		Start:       start,
 		End:         end,
 		Permissions: permissions,
@@ -187,10 +337,18 @@ func ParseMappedRegion(line string) (MappedRegion, error) {
 		Inode:       inode,
 		Pathname:    pathname,
 		IsFile:      isFile,
-	}, nil
+	}
+
+	return region, nil
 }
 
-func NewProcessContext(pid uint32) (ProcessContext, error) {
+func (region *MappedRegion) String() string {
+	return fmt.Sprintf("MappedRegion(start=0x%x, end=0x%x, permissions=%s, offset=0x%x, device=%s, inode=%d, pathname=%s, isFile=%t)",
+		region.Start, region.End, region.Permissions, region.Offset, region.Device, region.Inode, region.Pathname, region.IsFile)
+}
+
+// Create a ProcessContext for a running process
+func NewProcessContext(pid int) (ProcessContext, error) {
 	maps_path := fmt.Sprintf("/proc/%d/maps", pid)
 
 	file, err := os.Open(maps_path)
@@ -208,7 +366,7 @@ func NewProcessContext(pid uint32) (ProcessContext, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		region, err := ParseMappedRegion(line)
+		region, err := parseMappedRegion(line)
 
 		if err != nil {
 			continue
@@ -232,13 +390,20 @@ func NewProcessContext(pid uint32) (ProcessContext, error) {
 			elfCtx, err := NewElfContext(r.Pathname)
 
 			if err != nil {
-				// moan about it
 				continue
 			}
 
 			elfFiles[r.Pathname] = elfCtx
 		}
 	}
+
+	/*
+	   fmt.Printf("Regions: %d\n", len(regions))
+
+	   for i, r := range regions {
+	   fmt.Printf("%d: %s\n", i, r.String())
+	   }
+	*/
 
 	ctx := ProcessContext{
 		Pid:     pid,
@@ -249,24 +414,35 @@ func NewProcessContext(pid uint32) (ProcessContext, error) {
 	return ctx, nil
 }
 
-func (ctx *ElfContext) GetSymbol(offset uint64) (*elf.Symbol, error) {
-	idx, ok := slices.BinarySearchFunc(ctx.Symbols, offset, func(symbol elf.Symbol, offset uint64) int {
-		if symbol.Value > offset {
-			return -1
-		} else if symbol.Value+symbol.Size < offset {
+// Fetch a section from an ELF file, based on the section index
+func (ctx *ElfContext) GetSection(idx elf.SectionIndex) *elf.Section {
+	if idx == 0 || int(idx) > len(ctx.File.Sections) {
+		return nil
+	}
+
+	return ctx.File.Sections[idx]
+}
+
+// Fetch a symbol from an ELF file, based on the file offset
+func (ctx *ElfContext) GetSymbol(offset uint64) (*Symbol, error) {
+	idx, ok := slices.BinarySearchFunc(ctx.Symbols, offset, func(symbol Symbol, offset uint64) int {
+		if symbol.FileOffset > offset {
 			return 1
+		} else if symbol.FileOffset+symbol.Size < offset {
+			return -1
 		} else {
 			return 0
 		}
 	})
 
 	if !ok {
-		return nil, errors.New("symbol not found at given offset")
+		return nil, fmt.Errorf("symbol not found at offset 0x%x", offset)
 	}
 
 	return &ctx.Symbols[idx], nil
 }
 
+// Resolve a StackFrame from a running process, based on the instruction pointer
 func (ctx *ProcessContext) ResolveFrame(ip uint64) StackFrame {
 	frame := StackFrame{
 		InstructionPointer: ip,
@@ -274,9 +450,9 @@ func (ctx *ProcessContext) ResolveFrame(ip uint64) StackFrame {
 
 	idx, ok := slices.BinarySearchFunc(ctx.Regions, ip, func(region MappedRegion, ip uint64) int {
 		if region.Start > ip {
-			return -1
-		} else if region.End < ip {
 			return 1
+		} else if region.End < ip {
+			return -1
 		} else {
 			return 0
 		}
@@ -301,7 +477,7 @@ func (ctx *ProcessContext) ResolveFrame(ip uint64) StackFrame {
 	elfFile, ok := ctx.Elfs[region.Pathname]
 
 	if !ok {
-		frame.Error = errors.New("corresponding elf file not found")
+		frame.Error = fmt.Errorf("elf file %s not found", region.Pathname)
 
 		return frame
 	}
@@ -311,13 +487,13 @@ func (ctx *ProcessContext) ResolveFrame(ip uint64) StackFrame {
 
 	symbol, err := elfFile.GetSymbol(fileOffset)
 
-	offset := fileOffset - symbol.Value
-
 	if err != nil {
 		frame.Error = err
 
 		return frame
 	}
+
+	offset := fileOffset - symbol.FileOffset
 
 	frame.Symbol = symbol
 
@@ -326,8 +502,9 @@ func (ctx *ProcessContext) ResolveFrame(ip uint64) StackFrame {
 	return frame
 }
 
+// Resolve a stack trace from a running process, given the list of instruction pointers on the stack
 func (ctx *ProcessContext) GetStackTrace(stack []uint64) []StackFrame {
-	frames := make([]StackFrame, len(stack))
+	frames := make([]StackFrame, 0, len(stack))
 
 	for _, ip := range stack {
 		frame := ctx.ResolveFrame(ip)
