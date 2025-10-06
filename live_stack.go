@@ -130,6 +130,10 @@ type Symbol struct {
 	FileOffset uint64
 }
 
+func (frame *StackFrame) IsNull() bool {
+	return frame.Symbol == nil
+}
+
 func (frame *StackFrame) Describe(idx int) string {
 	var sb strings.Builder
 
